@@ -8,6 +8,9 @@ import mongoose from "mongoose";
 import { userAuth } from "./middleware.js";
 import cors from "cors";
 import { JWT_USER_SECRET } from "./config.js";
+import { qdrant } from "./qdrant.js";
+import { createEmbedding } from "./embedding.js";
+import {v4 as uuidv4} from "uuid";
 
 const app = express();
 app.use(express.json());
@@ -98,13 +101,39 @@ app.post("/api/v1/content", userAuth, async (req, res) => {
 
   const { title, type, link, tags } = req.body;
   try {
-    await ContentModel.create({
+    const content = await ContentModel.create({
       title,
       type,
       link,
       tags,
       userId: req.userId,
     });
+    const textToEmbed = `
+      Title: ${title}
+      Type: ${type}
+      Tags: ${tags.join(" ")}
+    `;
+    const embedding = await createEmbedding(textToEmbed);
+
+    await qdrant.upsert("content",{
+      wait: true,
+      points: [
+        {
+          id: uuidv4(),
+          vector: embedding,
+          payload: {
+            contentId: content._id.toString(),
+            userId: req.userId,
+            title,
+            type,
+            tags
+          }
+        }
+      ]
+    })
+    console.log("stored in qdrant");
+    console.log("Embedding created:", embedding.length);  
+  
     return res.status(200).send({
       message: "Content created",
     });
@@ -201,6 +230,53 @@ app.get("/api/v1/brain/share/:hash", async (req, res) => {
   } catch (err) {
     return res.status(500).send({
       message: "Internal server error",
+    });
+  }
+});
+
+app.post("/api/v1/search",userAuth,async (req,res) => {
+  const { query } = req.body;
+  try{
+    const queryEmbedding = await createEmbedding(query);
+    const result = await qdrant.search("content",{
+      vector: queryEmbedding,
+      limit: 5,
+      filter:{
+        must: [
+          {
+            key: "userId",
+            match: {
+              value: req.userId
+            }
+          }
+        ]
+      }
+    });
+    console.log(
+      result.map(r => ({
+        score: r.score,
+        contentId: r.payload?.contentId
+      }))
+    );
+    const contentIds = result.map(
+      (r: any) => r.payload?.contentId
+    );
+    const contents = await ContentModel.find({
+      _id: { $in: contentIds }
+    });
+    const contentMap = new Map(
+      contents.map(content => [content._id.toString(),content])
+    );
+    const orderedContents = contentIds
+      .map(id=>contentMap.get(id.toString()))
+      .filter(Boolean);
+    return res.status(200).json({
+      contents: orderedContents
+    });
+  } catch(err){
+    console.error(err);
+    return res.status(500).json({
+      message: "Search failed"
     });
   }
 });
